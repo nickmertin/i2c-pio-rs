@@ -46,15 +46,15 @@ use either::Either::{Left, Right};
 use fugit::HertzU32;
 use heapless::Deque;
 use i2c_cmd::{restart, start, CmdWord, Data};
-use pio::Instruction;
+use pio::{pio_asm, Instruction};
 use rp2040_hal::{
     gpio::{
         AnyPin, Function, FunctionNull, OutputEnableOverride, Pin, PinId, PullType, PullUp,
         ValidFunction,
     },
     pio::{
-        PIOExt, PinDir, PinState, Rx, ShiftDirection, StateMachine, StateMachineIndex, Tx,
-        UninitStateMachine, PIO,
+        InstalledProgram, PIOExt, PinDir, PinState, Rx, ShiftDirection, StateMachine,
+        StateMachineIndex, Tx, UninitStateMachine, PIO,
     },
 };
 
@@ -153,7 +153,7 @@ where
     SDA: AnyPin,
     SCL: AnyPin,
 {
-    pio: &'pio mut PIO<P>,
+    pio: &'pio ConfiguredPio<P>,
     sm: StateMachine<(P, SMI), rp2040_hal::pio::Running>,
     tx: Tx<(P, SMI)>,
     rx: Rx<(P, SMI)>,
@@ -172,7 +172,7 @@ where
     ///
     /// Note: the PIO must have been reset before using this driver.
     pub fn new(
-        pio: &'pio mut PIO<P>,
+        pio: &'pio ConfiguredPio<P>,
         sda: SDA,
         scl: SCL,
         sm: UninitStateMachine<(P, SMI)>,
@@ -187,54 +187,9 @@ where
     {
         let (sda, scl): (SDA::Type, SCL::Type) = (sda.into(), scl.into());
 
-        let mut program = pio_proc::pio_asm!(
-            ".side_set 1 opt pindirs"
-
-            "byte_nack:"
-            "  jmp  y--     byte_end  ; continue if NAK was expected"
-            "  irq  wait    0    rel  ; otherwise stop, ask for help (raises the irq line (0+SMI::id())%4)"
-            "  jmp          byte_end  ; resumed, finalize the current byte"
-
-            "byte_send:"
-            "  out  y       1         ; Unpack FINAL"
-            "  set  x       7         ; loop 8 times"
-
-            "bitloop:"
-            "  out  pindirs 1                [7] ; Serialize write data (all-ones is reading)"
-            "  nop                    side 1 [2] ; SCL rising edge"
-            //      polarity
-            "  wait 1       gpio 0           [4] ; Allow clock to be stretched"
-            "  in   pins 1                   [7] ; Sample read data in middle of SCL pulse"
-            "  jmp  x--     bitloop   side 0 [7] ; SCL falling edge"
-
-            // Handle ACK pulse
-            "  out  pindirs 1                [7] ; On reads, we provide the ACK"
-            "  nop                    side 1 [7] ; SCL rising edge"
-            //      polarity
-            "  wait 1       gpio 0           [7] ; Allow clock to be stretched"
-            "  jmp  pin     byte_nack side 0 [2] ; Test SDA for ACK/NACK, fall through if ACK"
-
-            "byte_end:"
-            "  push block             ; flush the current byte in isr to the FIFO"
-
-            ".wrap_target"
-            "  out  x       6         ; Unpack Instr count"
-            "  jmp  !x      byte_send ; Instr == 0, this is a data record"
-            "  out  null    10        ; Instr > 0, remainder of this OSR is invalid"
-
-            "do_exec:"
-            "  out  exec    16        ; Execute one instruction per FIFO word"
-            "  jmp  x--     do_exec"
-            ".wrap"
-        )
-        .program;
-        // patch the program to allow scl to be any pin
-        program.code[7] |= u16::from(scl.id().num);
-        program.code[12] |= u16::from(scl.id().num);
-
-        // Install the program into PIO instruction memory.
-        let installed = pio.install(&program).unwrap();
-        let wrap_target = installed.wrap_target();
+        // // patch the program to allow scl to be any pin
+        // program.code[7] |= u16::from(scl.id().num);
+        // program.code[12] |= u16::from(scl.id().num);
 
         // Configure the PIO state machine.
         let bit_freq = 32 * bus_freq;
@@ -256,25 +211,26 @@ where
         let frac: u8 = frac as u8;
 
         // init
-        let (mut sm, rx, tx) = rp2040_hal::pio::PIOBuilder::from_installed_program(installed)
-            // use both RX & TX FIFO
-            .buffers(rp2040_hal::pio::Buffers::RxTx)
-            // Pin configuration
-            .set_pins(sda.id().num, 1)
-            .out_pins(sda.id().num, 1)
-            .in_pin_base(sda.id().num)
-            .side_set_pin_base(scl.id().num)
-            .jmp_pin(sda.id().num)
-            // OSR config
-            .out_shift_direction(ShiftDirection::Left)
-            .autopull(true)
-            .pull_threshold(16)
-            // ISR config
-            .in_shift_direction(ShiftDirection::Left)
-            .push_threshold(8)
-            // clock config
-            .clock_divisor_fixed_point(int, frac)
-            .build(sm);
+        let (mut sm, rx, tx) =
+            rp2040_hal::pio::PIOBuilder::from_installed_program(pio.installed_program)
+                // use both RX & TX FIFO
+                .buffers(rp2040_hal::pio::Buffers::RxTx)
+                // Pin configuration
+                .set_pins(sda.id().num, 1)
+                .out_pins(sda.id().num, 1)
+                .in_pin_base(sda.id().num)
+                .side_set_pin_base(scl.id().num)
+                .jmp_pin(sda.id().num)
+                // OSR config
+                .out_shift_direction(ShiftDirection::Left)
+                .autopull(true)
+                .pull_threshold(16)
+                // ISR config
+                .in_shift_direction(ShiftDirection::Left)
+                .push_threshold(8)
+                // clock config
+                .clock_divisor_fixed_point(int, frac)
+                .build(sm);
 
         // enable pull up on SDA & SCL: idle bus
         let sda: Pin<_, _, PullUp> = sda.into_pull_type();
@@ -309,7 +265,7 @@ where
         sm.exec_instruction(pio::Instruction {
             operands: pio::InstructionOperands::JMP {
                 condition: pio::JmpCondition::Always,
-                address: wrap_target,
+                address: pio.installed_program.wrap_target(),
             },
             delay: 0,
             side_set: None,
@@ -330,7 +286,7 @@ where
 
     fn has_irq(&mut self) -> bool {
         let mask = 1 << SMI::id();
-        self.pio.get_irq_raw() & mask != 0
+        self.pio.pio.get_irq_raw() & mask != 0
     }
 
     fn err_with(&mut self, err: Error) -> Result<(), Error> {
@@ -353,7 +309,7 @@ where
                 side_set: None,
             });
             // resume pio driver
-            self.pio.clear_irq(1 << SMI::id());
+            self.pio.pio.clear_irq(1 << SMI::id());
         }
         // generate stop condition
         self.generate_stop();
@@ -458,7 +414,7 @@ where
     #[allow(clippy::type_complexity)]
     pub fn free(self) -> ((SDA::Type, SCL::Type), UninitStateMachine<(P, SMI)>) {
         let Self {
-            pio,
+            // pio,
             sm,
             tx,
             rx,
@@ -466,12 +422,86 @@ where
             scl,
             ..
         } = self;
-        let (uninit, program) = sm.uninit(rx, tx);
-        pio.uninstall(program);
+        let (uninit, _program) = sm.uninit(rx, tx);
+        // pio.uninstall(program);
 
         let scl = Self::reset_pin(scl);
         let sda = Self::reset_pin(sda);
 
         ((sda, scl), uninit)
+    }
+}
+
+pub struct ConfiguredPio<P: PIOExt> {
+    pio: PIO<P>,
+    installed_program: InstalledProgram<P>,
+}
+
+impl<P: PIOExt> ConfiguredPio<P> {
+    pub fn free(mut self) -> PIO<P> {
+        self.pio.uninstall(self.installed_program);
+        self.pio
+    }
+}
+
+pub trait PIOConfigure {
+    type PIO: PIOExt;
+
+    fn configure_as_i2c(self) -> ConfiguredPio<Self::PIO>;
+}
+
+impl<P: PIOExt> PIOConfigure for PIO<P> {
+    type PIO = P;
+
+    fn configure_as_i2c(mut self) -> ConfiguredPio<Self::PIO> {
+        let program = pio_asm!(
+            ".side_set 1 opt pindirs"
+
+            "byte_nack:"
+            "  jmp  y--     byte_end  ; continue if NAK was expected"
+            "  irq  wait    0    rel  ; otherwise stop, ask for help (raises the irq line (0+SMI::id())%4)"
+            "  jmp          byte_end  ; resumed, finalize the current byte"
+
+            "byte_send:"
+            "  out  y       1         ; Unpack FINAL"
+            "  set  x       7         ; loop 8 times"
+
+            "bitloop:"
+            "  out  pindirs 1                [7] ; Serialize write data (all-ones is reading)"
+            "  nop                    side 1 [2] ; SCL rising edge"
+            //      polarity
+            "  wait 1       gpio 0           [4] ; Allow clock to be stretched"
+            "  in   pins 1                   [7] ; Sample read data in middle of SCL pulse"
+            "  jmp  x--     bitloop   side 0 [7] ; SCL falling edge"
+
+            // Handle ACK pulse
+            "  out  pindirs 1                [7] ; On reads, we provide the ACK"
+            "  nop                    side 1 [7] ; SCL rising edge"
+            //      polarity
+            "  wait 1       gpio 0           [7] ; Allow clock to be stretched"
+            "  jmp  pin     byte_nack side 0 [2] ; Test SDA for ACK/NACK, fall through if ACK"
+
+            "byte_end:"
+            "  push block             ; flush the current byte in isr to the FIFO"
+
+            ".wrap_target"
+            "  out  x       6         ; Unpack Instr count"
+            "  jmp  !x      byte_send ; Instr == 0, this is a data record"
+            "  out  null    10        ; Instr > 0, remainder of this OSR is invalid"
+
+            "do_exec:"
+            "  out  exec    16        ; Execute one instruction per FIFO word"
+            "  jmp  x--     do_exec"
+            ".wrap"
+        )
+        .program;
+
+        // Install the program into PIO instruction memory.
+        let installed = self.install(&program).unwrap();
+
+        ConfiguredPio {
+            pio: self,
+            installed_program: installed,
+        }
     }
 }
